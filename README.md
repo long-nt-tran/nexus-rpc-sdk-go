@@ -195,3 +195,37 @@ go test -v ./...
 ```shell
 golangci-lint run --verbose --timeout 1m --fix=false
 ```
+
+### Change operations while a handler runs
+
+A registered `Service` remains live after `ServiceRegistry.NewHandler` and after
+registration with a Temporal Worker. Use `Register` to add operations, `Update`
+to replace them, and `Delete` to remove them. These methods and `Operation` are
+safe to call while requests run. Do not change the service name after registration.
+`Update` and `Delete` reject missing names without changing the service.
+
+```go
+service := nexus.NewService("tools")
+service.MustRegister(listToolsOperation)
+// Register the service and start the Worker or handler.
+err := service.Register(echoOperation)
+// Check err.
+err = service.Update(cachedEchoOperation) // Same operation name.
+err = service.Delete("echo")
+```
+
+Each request captures one handler before decoding its input. Updating or deleting
+an operation does not replace a handler already captured by a request. Async
+backing executions continue independently of the registry.
+
+`service.RegisterDynamicOperation(handler)` registers one fallback implementing
+`nexus.OperationHandler[*nexus.LazyValue, any]`. Named operations take precedence.
+The fallback reads the requested name through `nexus.ExtractHandlerInfo(ctx)`.
+Its start method receives raw input and must call `input.Consume(&value)` before
+returning. Unknown start and cancel names both reach the fallback. Handlers must
+be safe for concurrent calls. A service with only a dynamic handler is valid.
+
+Frameworks can call `registry.SetCancelFallback(handler)` before `NewHandler` to
+handle cancellation after operation removal. It applies only to registered
+services with no matching named or dynamic handler. Middleware still runs.
+Unknown starts continue to return `NOT_FOUND`.

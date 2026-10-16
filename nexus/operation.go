@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 // NoValue is a marker type for an operations that do not accept any input or return a value (nil).
@@ -127,7 +128,9 @@ func (h *syncOperation[I, O]) Start(ctx context.Context, input I, options StartO
 type Service struct {
 	Name string
 
+	mu         sync.RWMutex
 	operations map[string]RegisterableOperation
+	dynamic    OperationHandler[*LazyValue, any]
 }
 
 // NewService constructs a [Service].
@@ -142,8 +145,10 @@ func NewService(name string) *Service {
 // Returns an error if duplicate operations were registered with the same name or when trying to register an operation
 // with no name.
 //
-// Can be called multiple times and is not thread safe.
+// Can be called while requests are being handled. Existing requests keep their captured handler.
 func (s *Service) Register(operations ...RegisterableOperation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var dups []string
 	for _, op := range operations {
 		if op.Name() == "" {
@@ -165,7 +170,7 @@ func (s *Service) Register(operations ...RegisterableOperation) error {
 // Panics if duplicate operations were registered with the same name or when trying to register an operation with no
 // name.
 //
-// Can be called multiple times and is not thread safe.
+// Can be called while requests are being handled. Existing requests keep their captured handler.
 func (s *Service) MustRegister(operations ...RegisterableOperation) {
 	if err := s.Register(operations...); err != nil {
 		panic(err)
@@ -174,7 +179,74 @@ func (s *Service) MustRegister(operations ...RegisterableOperation) {
 
 // Operation returns an operation by name or nil if not found.
 func (s *Service) Operation(name string) RegisterableOperation {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.operations[name]
+}
+
+// Update replaces registered operations. It fails without changes if a name is absent.
+// Requests that have captured a handler continue using that handler.
+func (s *Service) Update(operations ...RegisterableOperation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, op := range operations {
+		if op.Name() == "" || s.operations[op.Name()] == nil {
+			return fmt.Errorf("cannot update unregistered operation %q", op.Name())
+		}
+	}
+	for _, op := range operations {
+		s.operations[op.Name()] = op
+	}
+	return nil
+}
+
+// Delete removes registered operations immediately. It fails without changes if a name is absent.
+// Running asynchronous executions continue independently of the service registry.
+func (s *Service) Delete(names ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, name := range names {
+		if s.operations[name] == nil {
+			return fmt.Errorf("cannot delete unregistered operation %q", name)
+		}
+	}
+	for _, name := range names {
+		delete(s.operations, name)
+	}
+	return nil
+}
+
+// RegisterDynamicOperation registers the single fallback for unknown start and cancel names.
+// Start receives the raw LazyValue and must consume it before returning. The requested
+// operation name is available through ExtractHandlerInfo. Named operations take precedence.
+// The handler may be invoked concurrently and must be safe for concurrent use.
+func (s *Service) RegisterDynamicOperation(handler OperationHandler[*LazyValue, any]) error {
+	if handler == nil {
+		return errors.New("dynamic operation handler must not be nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dynamic != nil {
+		return errors.New("dynamic operation handler already registered")
+	}
+	s.dynamic = handler
+	return nil
+}
+
+// DynamicOperation returns the fallback handler, or nil if none is registered.
+func (s *Service) DynamicOperation() OperationHandler[*LazyValue, any] {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dynamic
+}
+
+func (s *Service) resolve(name string) (RegisterableOperation, OperationHandler[*LazyValue, any]) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if op := s.operations[name]; op != nil {
+		return op, nil
+	}
+	return nil, s.dynamic
 }
 
 // MiddlewareFunc is a function which receives an OperationHandler and returns another OperationHandler.
@@ -187,8 +259,9 @@ type MiddlewareFunc func(ctx context.Context, next OperationHandler[any, any]) (
 
 // A ServiceRegistry registers services and constructs a [Handler] that dispatches operations requests to those services.
 type ServiceRegistry struct {
-	services   map[string]*Service
-	middleware []MiddlewareFunc
+	services       map[string]*Service
+	middleware     []MiddlewareFunc
+	cancelFallback OperationHandler[any, any]
 }
 
 // NewServiceRegistry constructs an empty [ServiceRegistry].
@@ -241,40 +314,39 @@ func (s *ServiceRegistry) Use(middleware ...MiddlewareFunc) {
 	s.middleware = append(s.middleware, middleware...)
 }
 
+// SetCancelFallback sets a handler for cancellation of unknown operation names in
+// registered services. Named and dynamic handlers take precedence. Call this before
+// NewHandler. Frameworks can use it to cancel backing executions after operation removal.
+func (r *ServiceRegistry) SetCancelFallback(handler OperationHandler[any, any]) {
+	r.cancelFallback = handler
+}
+
 // NewHandler creates a [Handler] that dispatches requests to registered operations based on their name.
 func (r *ServiceRegistry) NewHandler() (Handler, error) {
 	if len(r.services) == 0 {
 		return nil, errors.New("must register at least one service")
 	}
 	for _, service := range r.services {
-		if len(service.operations) == 0 {
+		service.mu.RLock()
+		empty := len(service.operations) == 0 && service.dynamic == nil
+		service.mu.RUnlock()
+		if empty {
 			return nil, fmt.Errorf("service %q has no operations registered", service.Name)
 		}
 	}
 
-	return &registryHandler{services: r.services, middlewares: r.middleware}, nil
+	return &registryHandler{services: r.services, middlewares: r.middleware, cancelFallback: r.cancelFallback}, nil
 }
 
 type registryHandler struct {
 	UnimplementedHandler
 
-	services    map[string]*Service
-	middlewares []MiddlewareFunc
+	services       map[string]*Service
+	middlewares    []MiddlewareFunc
+	cancelFallback OperationHandler[any, any]
 }
 
-func (r *registryHandler) operationHandler(ctx context.Context) (OperationHandler[any, any], error) {
-	options := ExtractHandlerInfo(ctx)
-	s, ok := r.services[options.Service]
-	if !ok {
-		return nil, NewHandlerErrorf(HandlerErrorTypeNotFound, "service %q not found", options.Service)
-	}
-	h, ok := s.operations[options.Operation]
-	if !ok {
-		return nil, NewHandlerErrorf(HandlerErrorTypeNotFound, "operation %q not found", options.Operation)
-	}
-
-	var handler OperationHandler[any, any]
-	handler = &rootOperationHandler{h: h}
+func (r *registryHandler) wrapHandler(ctx context.Context, handler OperationHandler[any, any]) (OperationHandler[any, any], error) {
 	for i := len(r.middlewares) - 1; i >= 0; i-- {
 		var err error
 		handler, err = r.middlewares[i](ctx, handler)
@@ -285,37 +357,83 @@ func (r *registryHandler) operationHandler(ctx context.Context) (OperationHandle
 	return handler, nil
 }
 
+func (r *registryHandler) resolve(service, operation string) (RegisterableOperation, OperationHandler[*LazyValue, any], error) {
+	s := r.services[service]
+	if s == nil {
+		return nil, nil, NewHandlerErrorf(HandlerErrorTypeNotFound, "service %q not found", service)
+	}
+	op, dynamic := s.resolve(operation)
+	return op, dynamic, nil
+}
+
 // CancelOperation implements Handler.
 func (r *registryHandler) CancelOperation(ctx context.Context, service, operation, token string, options CancelOperationOptions) error {
-	h, err := r.operationHandler(ctx)
+	op, dynamic, err := r.resolve(service, operation)
 	if err != nil {
 		return err
 	}
-	return h.Cancel(ctx, token, options)
+	var handler OperationHandler[any, any]
+	switch {
+	case op != nil:
+		handler = &rootOperationHandler{h: op}
+	case dynamic != nil:
+		handler = &dynamicOperationHandler{handler: dynamic}
+	case r.cancelFallback != nil:
+		handler = r.cancelFallback
+	default:
+		return NewHandlerErrorf(HandlerErrorTypeNotFound, "operation %q not found", operation)
+	}
+	handler, err = r.wrapHandler(ctx, handler)
+	if err != nil {
+		return err
+	}
+	return handler.Cancel(ctx, token, options)
 }
 
 // StartOperation implements Handler.
 func (r *registryHandler) StartOperation(ctx context.Context, service, operation string, input *LazyValue, options StartOperationOptions) (HandlerStartOperationResult[any], error) {
-	s, ok := r.services[service]
-	if !ok {
-		return nil, NewHandlerErrorf(HandlerErrorTypeNotFound, "service %q not found", service)
-	}
-	ro, ok := s.operations[operation]
-	if !ok {
-		return nil, NewHandlerErrorf(HandlerErrorTypeNotFound, "operation %q not found", operation)
-	}
-
-	h, err := r.operationHandler(ctx)
+	op, dynamic, err := r.resolve(service, operation)
 	if err != nil {
 		return nil, err
 	}
-	m, _ := reflect.TypeOf(ro).MethodByName("Start")
-	inputType := m.Type.In(2)
-	iptr := reflect.New(inputType).Interface()
-	if err := input.Consume(iptr); err != nil {
+	var handler OperationHandler[any, any]
+	var value any
+	switch {
+	case op != nil:
+		handler = &rootOperationHandler{h: op}
+	case dynamic != nil:
+		handler = &dynamicOperationHandler{handler: dynamic}
+	default:
+		return nil, NewHandlerErrorf(HandlerErrorTypeNotFound, "operation %q not found", operation)
+	}
+	handler, err = r.wrapHandler(ctx, handler)
+	if err != nil {
 		return nil, err
 	}
-	return h.Start(ctx, reflect.ValueOf(iptr).Elem().Interface(), options)
+	if dynamic != nil {
+		value = input
+	} else {
+		m, _ := reflect.TypeOf(op).MethodByName("Start")
+		iptr := reflect.New(m.Type.In(2)).Interface()
+		if err := input.Consume(iptr); err != nil {
+			return nil, err
+		}
+		value = reflect.ValueOf(iptr).Elem().Interface()
+	}
+	return handler.Start(ctx, value, options)
+}
+
+type dynamicOperationHandler struct {
+	UnimplementedOperation[any, any]
+	handler OperationHandler[*LazyValue, any]
+}
+
+func (h *dynamicOperationHandler) Start(ctx context.Context, input any, options StartOperationOptions) (HandlerStartOperationResult[any], error) {
+	return h.handler.Start(ctx, input.(*LazyValue), options)
+}
+
+func (h *dynamicOperationHandler) Cancel(ctx context.Context, token string, options CancelOperationOptions) error {
+	return h.handler.Cancel(ctx, token, options)
 }
 
 type rootOperationHandler struct {
