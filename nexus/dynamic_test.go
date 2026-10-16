@@ -146,3 +146,17 @@ func TestConcurrentOperationUpdates(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestCancelFallbackAllowsEmptyService(t *testing.T) {
+	registry := NewServiceRegistry()
+	registry.MustRegister(NewService("tools"))
+	fallback := &cancelFallback{}
+	registry.SetCancelFallback(fallback)
+	handler, err := registry.NewHandler()
+	require.NoError(t, err)
+	ctx := WithHandlerContext(context.Background(), HandlerInfo{Service: "tools", Operation: "removed"})
+	require.NoError(t, handler.CancelOperation(ctx, "tools", "removed", "token", CancelOperationOptions{}))
+	require.EqualValues(t, 1, fallback.calls.Load())
+	_, err = handler.StartOperation(ctx, "tools", "removed", lv(t, 5), StartOperationOptions{})
+	require.Error(t, err)
+}

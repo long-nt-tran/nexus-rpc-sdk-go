@@ -228,4 +228,6 @@ be safe for concurrent calls. A service with only a dynamic handler is valid.
 Frameworks can call `registry.SetCancelFallback(handler)` before `NewHandler` to
 handle cancellation after operation removal. It applies only to registered
 services with no matching named or dynamic handler. Middleware still runs.
-Unknown starts continue to return `NOT_FOUND`.
+Unknown starts continue to return `NOT_FOUND`. A registered service may be empty
+when a cancel fallback is configured, so cancellation still works after the last
+operation has been removed and the host restarts.

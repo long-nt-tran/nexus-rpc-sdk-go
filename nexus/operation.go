@@ -328,7 +328,7 @@ func (r *ServiceRegistry) NewHandler() (Handler, error) {
 	}
 	for _, service := range r.services {
 		service.mu.RLock()
-		empty := len(service.operations) == 0 && service.dynamic == nil
+		empty := len(service.operations) == 0 && service.dynamic == nil && r.cancelFallback == nil
 		service.mu.RUnlock()
 		if empty {
 			return nil, fmt.Errorf("service %q has no operations registered", service.Name)
